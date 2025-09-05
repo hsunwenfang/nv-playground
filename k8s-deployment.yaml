@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mnist-gpu-demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mnist-gpu
+  namespace: mnist-gpu-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mnist-gpu
+  template:
+    metadata:
+      labels:
+        app: mnist-gpu
+    spec:
+      containers:
+      - name: mnist-gpu
+        image: hsunacr.azurecr.io/nv-mnist:latest
+        imagePullPolicy: Never
+        env:
+        - name: EPOCHS
+          value: "1"
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+          requests:
+            nvidia.com/gpu: 1
