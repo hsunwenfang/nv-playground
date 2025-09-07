@@ -1,198 +1,209 @@
-import os
-import sys
-import time
-import json
+"""Tiny GPT-2 (TF backend) Chat Service.
+
+Provides /chat and /healthz endpoints. Uses HuggingFace sshleifer/tiny-gpt2
+loaded via TensorFlow (no torch). Keeps a small per-session rolling context.
+"""
+
+import os, json, time, hashlib, threading
 from datetime import datetime, timezone
+from collections import defaultdict, deque
+from typing import List, Dict, Any, Optional
+
+import tensorflow as tf
+from transformers import AutoTokenizer, AutoConfig, TFAutoModelForCausalLM, set_seed
+try:
+    from transformers import TFAutoModelForSeq2SeqLM  # available for encoder-decoder models (e.g., T5)
+except Exception:  # older versions may not have this symbol
+    TFAutoModelForSeq2SeqLM = None  # type: ignore
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
 try:
-    import tensorflow as tf
-    from tensorflow.keras import layers, models
-    from tensorflow.keras.datasets import mnist
-    import numpy as np
-except Exception as e:
-    # If TensorFlow isn't available locally, emit structured logs and exit gracefully.
-    def log(event, level="INFO", **fields):
-        record = {"ts": datetime.now(timezone.utc).isoformat(), "level": level, "event": event}
-        record.update(fields)
-        print(json.dumps(record, ensure_ascii=False))
-    log("tensorflow_import_missing", error=str(e), hint="Run inside the provided Docker image for GPU support")
-    sys.exit(0)
+    from prometheus_client import Counter, Histogram, Gauge, start_http_server
+    PROM_ENABLED = True
+except Exception:
+    PROM_ENABLED = False
 
 
-def log(event, level="INFO", **fields):
+def log(event: str, level: str = "INFO", **fields):
     record = {"ts": datetime.now(timezone.utc).isoformat(), "level": level, "event": event}
     record.update(fields)
     print(json.dumps(record, ensure_ascii=False))
 
 
-def see_gpus():
-    gpus = tf.config.list_physical_devices('GPU')
-    log("gpu_list", count=len(gpus), gpus=[g.name for g in gpus])
-    return len(gpus) > 0
+MODEL_NAME = os.environ.get('MODEL_NAME', 'sshleifer/tiny-gpt2')  # override via env; default tiny causal LM
+REQUIRE_GPU = os.environ.get("REQUIRE_GPU", "1") == "1"
+ALLOW_CPU_FALLBACK = os.environ.get("ALLOW_CPU_FALLBACK", "0") == "1"
+MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "4"))
+GEN_DEFAULTS = {
+    "max_new_tokens": int(os.environ.get("MAX_NEW_TOKENS", "40")),
+    "temperature": float(os.environ.get("TEMPERATURE", "0.8")),
+    "top_p": float(os.environ.get("TOP_P", "0.95")),
+    "do_sample": True,
+}
 
-
-def wait_for_gpu(timeout_secs: int = 60, interval_secs: int = 2) -> bool:
-    """Poll for at least one visible GPU until timeout.
-
-    Returns True if a GPU becomes available, False otherwise.
-    Uses TF device listing so it reflects container runtime visibility.
-    """
-    start = time.time()
-    while time.time() - start < timeout_secs:
-        if see_gpus():
-            log("gpu_ready")
-            return True
-        remaining = timeout_secs - int(time.time() - start)
-        log("gpu_wait_retry", remaining_seconds=remaining, interval=interval_secs)
-        time.sleep(interval_secs)
-    log("gpu_wait_timeout", timeout=timeout_secs, level="WARN")
-    return False
-
-
-def build_model():
-    model = models.Sequential([
-        layers.Input(shape=(28, 28, 1)),
-        layers.Conv2D(16, 3, activation='relu'),
-        layers.MaxPooling2D(),
-        layers.Conv2D(32, 3, activation='relu'),
-        layers.Flatten(),
-        layers.Dense(64, activation='relu'),
-        layers.Dense(10, activation='softmax')
-    ])
-    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-    return model
-
-
-def main():
-    # Optionally wait for GPU readiness
-    wait_timeout = int(os.environ.get("GPU_WAIT_TIMEOUT", "60"))
-    wait_interval = int(os.environ.get("GPU_WAIT_INTERVAL", "2"))
-    waited_gpu = wait_for_gpu(timeout_secs=wait_timeout, interval_secs=wait_interval)
-    log("gpu_usage_decided", using_gpu=waited_gpu)
-
-    (x_train, y_train), (x_test, y_test) = mnist.load_data()
-    x_train = x_train.astype('float32') / 255.0
-    x_test = x_test.astype('float32') / 255.0
-    x_train = np.expand_dims(x_train, -1)
-    x_test = np.expand_dims(x_test, -1)
-
-    # training parameters (tunable)
-    epochs = int(os.environ.get("EPOCHS", "1"))
-    batch_size = int(os.environ.get("BATCH_SIZE", "128"))
-    prefetch = int(os.environ.get("PREFETCH", "1"))
-    mixed_precision = os.environ.get("MIXED_PRECISION", "0") == "1"
-
-    # Enable mixed precision if requested
-    if mixed_precision:
+gpu_devices = tf.config.list_physical_devices('GPU')
+if not gpu_devices:
+    msg = "No GPU detected for TensorFlow runtime"
+    if REQUIRE_GPU and not ALLOW_CPU_FALLBACK:
+        log("startup_no_gpu", level="ERROR", require_gpu=REQUIRE_GPU)
+        raise SystemExit(msg)
+    else:
+        log("startup_gpu_absent_fallback", level="WARN", fallback=ALLOW_CPU_FALLBACK)
+else:
+    for g in gpu_devices:
         try:
-            from tensorflow.keras import mixed_precision
-            mixed_precision.set_global_policy('mixed_float16')
-            log("mixed_precision_enabled")
+            tf.config.experimental.set_memory_growth(g, True)
+        except Exception:
+            pass
+    log("startup_gpu_list", gpus=[d.name for d in gpu_devices])
+
+log("model_load_start", model=MODEL_NAME)
+set_seed(42)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+config = AutoConfig.from_pretrained(MODEL_NAME)
+is_enc_dec = getattr(config, 'is_encoder_decoder', False)
+model = None
+pad_id = None
+try:
+    if is_enc_dec:
+        if TFAutoModelForSeq2SeqLM is None:
+            raise ValueError("Encoder-decoder model requested but TFAutoModelForSeq2SeqLM not available in installed transformers.")
+        model = TFAutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    else:
+        model = TFAutoModelForCausalLM.from_pretrained(MODEL_NAME)
+        # Some GPT2 variants have no explicit pad token; fall back to eos
+        pad_id = tokenizer.eos_token_id
+except ValueError as e:
+    # Automatic fallback: if causal loader failed due to config mismatch, retry seq2seq
+    if 'Unrecognized configuration class' in str(e) and TFAutoModelForSeq2SeqLM is not None:
+        model = TFAutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    else:
+        raise
+
+if pad_id is None:
+    pad_id = tokenizer.eos_token_id
+
+log("model_load_complete", model=MODEL_NAME, pad_id=pad_id, encoder_decoder=is_enc_dec)
+
+history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=MAX_HISTORY * 2))
+_gen_lock = threading.Lock()
+
+if PROM_ENABLED:
+    REQ_COUNTER = Counter("tiny_gpt2_requests_total", "Chat requests", ["endpoint"])
+    ERR_COUNTER = Counter("tiny_gpt2_errors_total", "Errors", ["endpoint", "type"])
+    LATENCY = Histogram("tiny_gpt2_latency_seconds", "Latency", buckets=(0.05,0.1,0.2,0.5,1,2,5))
+    ACTIVE = Gauge("tiny_gpt2_active_sessions", "Active sessions")
+    start_http_server(int(os.environ.get("METRICS_PORT", "9100")))
+    log("metrics_server_started", port=int(os.environ.get("METRICS_PORT", "9100")))
+
+app = FastAPI(title="Tiny GPT-2 Chat", version="0.3.0")
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000)
+    session_id: Optional[str] = Field(None)
+    max_new_tokens: Optional[int] = Field(None, ge=1, le=256)
+    temperature: Optional[float] = Field(None, ge=0.0, le=2.0)
+    top_p: Optional[float] = Field(None, ge=0.0, le=1.0)
+
+
+class ChatResponse(BaseModel):
+    session_id: str
+    reply: str
+    model_latency_ms: int
+    history: List[Dict[str, Any]]
+
+
+@app.get("/healthz")
+def health():
+    if PROM_ENABLED:
+        ACTIVE.set(len(history))
+    return {"status": "ok", "model": MODEL_NAME, "time": datetime.utcnow().isoformat()}
+
+
+def build_prompt(session_id: str, new_msg: str) -> str:
+    parts = []
+    for role, content in history[session_id]:
+        parts.append(f"{role.title()}: {content}")
+    parts.append(f"User: {new_msg}")
+    parts.append("Assistant:")
+    return "\n".join(parts)
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+        t0 = time.time()
+        if PROM_ENABLED:
+            REQ_COUNTER.labels(endpoint="chat").inc()
+        session_id = req.session_id or hashlib.sha1(str(time.time_ns()).encode()).hexdigest()[:12]
+        try:
+            history[session_id].append(("user", req.message))
+            prompt = build_prompt(session_id, req.message)
+            gen_cfg = GEN_DEFAULTS.copy()
+            if req.max_new_tokens is not None:
+                gen_cfg["max_new_tokens"] = req.max_new_tokens
+            if req.temperature is not None:
+                gen_cfg["temperature"] = req.temperature
+            if req.top_p is not None:
+                gen_cfg["top_p"] = req.top_p
+            input_ids = tokenizer(prompt, return_tensors='tf').input_ids
+            with _gen_lock:
+                # Force GPU placement if available
+                if gpu_devices:
+                    with tf.device('/GPU:0'):
+                        outputs = model.generate(
+                            input_ids,
+                            max_new_tokens=gen_cfg["max_new_tokens"],
+                            temperature=gen_cfg["temperature"],
+                            top_p=gen_cfg["top_p"],
+                            do_sample=gen_cfg["do_sample"],
+                            pad_token_id=pad_id,
+                            eos_token_id=pad_id,
+                        )
+                else:
+                    outputs = model.generate(
+                        input_ids,
+                        max_new_tokens=gen_cfg["max_new_tokens"],
+                        temperature=gen_cfg["temperature"],
+                        top_p=gen_cfg["top_p"],
+                        do_sample=gen_cfg["do_sample"],
+                        pad_token_id=pad_id,
+                        eos_token_id=pad_id,
+                    )
+            text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            reply = text.split("Assistant:")[-1].strip()
+            if "\n\n" in reply:
+                reply = reply.split("\n\n")[0].strip()
+            history[session_id].append(("assistant", reply))
+            latency_ms = int((time.time() - t0) * 1000)
+            if PROM_ENABLED:
+                LATENCY.observe(latency_ms / 1000.0)
+            log("chat_generated", session_id=session_id, latency_ms=latency_ms, new_tokens=gen_cfg["max_new_tokens"])
+            return ChatResponse(
+                session_id=session_id,
+                reply=reply,
+                model_latency_ms=latency_ms,
+                history=[{"role": r, "content": c} for r, c in history[session_id]],
+            )
+        except HTTPException:
+            raise
         except Exception as e:
-            log("mixed_precision_failed", error=str(e), level="WARN")
-
-    model = build_model()
-
-    # Build tf.data pipeline for training subset to better control throughput
-    train_x = x_train[:5000]
-    train_y = y_train[:5000]
-    ds = tf.data.Dataset.from_tensor_slices((train_x, train_y))
-    ds = ds.shuffle(buffer_size=1000).batch(batch_size).prefetch(prefetch)
-
-    log("training_start", epochs=epochs, samples=5000, batch_size=batch_size, prefetch=prefetch, mixed_precision=mixed_precision)
-    t0 = time.time()
-    model.fit(ds, epochs=epochs, verbose=2)
-    train_seconds = time.time() - t0
-    log("training_complete", training_seconds=round(train_seconds, 3))
-
-    loss, acc = model.evaluate(x_test[:1000], y_test[:1000], verbose=0)
-    log("evaluation", subset_size=1000, loss=round(float(loss), 6), accuracy=round(float(acc), 6))
-
-    preds = model.predict(x_test[:10])
-    pred_labels = preds.argmax(axis=-1)
-    log("prediction_sample", count=10, predictions=pred_labels.tolist(), ground_truth=y_test[:10].tolist())
-
-    # Optional keep-alive loop for benchmarking and inspection.
-    # Set KEEP_ALIVE=1 to keep running indefinitely, or set KEEP_ALIVE_SECONDS=<n> to run for n seconds.
-    keep_alive = os.environ.get("KEEP_ALIVE", "0")
-    keep_alive_seconds = int(os.environ.get("KEEP_ALIVE_SECONDS", "0"))
-    bench_interval = int(os.environ.get("BENCH_SLEEP_SECONDS", "10"))
-
-    if keep_alive == "1" or keep_alive_seconds > 0:
-        import signal
-        stop = False
-
-        def _signal_handler(signum, frame):
-            nonlocal stop
-            log("signal_received", signal=signum)
-            stop = True
-
-        signal.signal(signal.SIGTERM, _signal_handler)
-        signal.signal(signal.SIGINT, _signal_handler)
-
-        start = time.time()
-        log("bench_start", keep_alive=keep_alive, keep_alive_seconds=keep_alive_seconds, interval=bench_interval)
-
-        while not stop:
-            # Periodic status log: GPU list + optional nvidia-smi snapshot if available
-            gpus = tf.config.list_physical_devices('GPU')
-            gpu_names = [g.name for g in gpus]
-            info = {"using_gpu": len(gpus) > 0, "gpus": gpu_names}
-            # Try to gather lightweight nvidia-smi stats if available
-            try:
-                import subprocess
-                out = subprocess.check_output(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"], stderr=subprocess.DEVNULL)
-                lines = out.decode().strip().splitlines()
-                metrics = []
-                for ln in lines:
-                    util, mem = [x.strip() for x in ln.split(',')]
-                    metrics.append({"util_percent": int(util), "mem_mib": int(mem)})
-                info["nvidia_smi"] = metrics
-            except Exception:
-                # nvidia-smi may not be present in all images; ignore if not available
-                info["nvidia_smi"] = None
-
-            # Log heartbeat
-            log("bench_heartbeat", **info)
-
-            # Check timeout for KEEP_ALIVE_SECONDS
-            if keep_alive_seconds > 0 and time.time() - start > keep_alive_seconds:
-                log("bench_timeout_reached", elapsed=int(time.time() - start))
-                break
-
-            # Sleep until next heartbeat or until signaled
-            for _ in range(bench_interval):
-                if stop:
-                    break
-                time.sleep(1)
-
-        log("bench_exit", reason=("signal" if stop else "timeout"))
-
-    # --- Minimal benchmarking harness & metrics endpoint ---
-    # Export a Prometheus metrics endpoint with simple timings and gauges.
-    try:
-        from prometheus_client import start_http_server, Gauge, Summary
-        METRICS_PORT = int(os.environ.get("METRICS_PORT", "8000"))
-
-        train_time = Summary('mnist_train_seconds', 'Time spent training the model')
-        inference_time = Summary('mnist_inference_seconds', 'Time spent running inference')
-        gpu_gauge = Gauge('mnist_gpu_count', 'Number of GPUs visible to the process')
-
-        # Start metrics server in background
-        start_http_server(METRICS_PORT)
-        log("metrics_server_started", port=METRICS_PORT)
-
-        # Record training time & inference time (if we want to re-run quickly)
-        # Note: we already trained above, but we can run a quick timed inference as a metric.
-        @inference_time.time()
-        def _record_inference():
-            _ = model.predict(x_test[:100])
-
-        gpu_gauge.set(len(tf.config.list_physical_devices('GPU')))
-        _record_inference()
-    except Exception as e:
-        log("metrics_setup_failed", error=str(e), level="WARN")
+            if PROM_ENABLED:
+                ERR_COUNTER.labels(endpoint="chat", type=type(e).__name__).inc()
+            log("chat_error", error=str(e), level="ERROR")
+            raise HTTPException(status_code=500, detail="internal error")
 
 
-if __name__ == '__main__':
-    main()
+def run():
+    import uvicorn
+    port = int(os.environ.get("APP_PORT", "8000"))
+    host = os.environ.get("APP_HOST", "0.0.0.0")
+    log("service_start", host=host, port=port, model=MODEL_NAME)
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+if __name__ == "__main__":
+    run()

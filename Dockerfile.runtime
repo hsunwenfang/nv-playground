@@ -1,0 +1,6 @@
+FROM tiny-chat:base AS runtime
+WORKDIR /app
+COPY app.py .
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8000 9100
+CMD ["python","app.py"]

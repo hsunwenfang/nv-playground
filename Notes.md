@@ -1,5 +1,38 @@
 
 
+# Q
+
+- Improve ETL pipeline for better GPU utilization
+
+- How is minikube consuming GPU by nvidia-device-plugin ds
+
+- Why is docker build for GPU image very slow
+   - Can it be GPU enhanced
+   - Will az acr build save it
+
+- Image Load is often slow
+   - Can build a smaller image
+   - Can minikube cache the base image
+
+- How does containerd decide which layer to cache
+
+- Parallelize the image pull with GPU
+
+- 1 pod 1 GPU or fractional GPU
+
+- Monitor GPU with nvidia-smi or DCGM or GPU Operator
+- Monitor GPU with metric-server or Prometheus/Grafana
+
+- Setup chat services to serve multiple requests in parralell
+
+- pod termniation seems to have issue
+
+# I
+
+- Can have better analysis with GRPC reflection (no need to maintain proto files)
+- nvidia-device-plugin
+
+
 
 - Design, implement, and maintain ML pipelines for automated training, testing, and deployment of machine learning models, ensuring scalability and efficiency.
 - Work collaboratively with ML engineers to troubleshoot and optimize model performance, ensuring models are production-ready and meet defined SLAs

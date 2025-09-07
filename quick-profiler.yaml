@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mnist-quick-profiler
+  namespace: mnist-gpu-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mnist-quick-profiler
+  template:
+    metadata:
+      labels:
+        app: mnist-quick-profiler
+    spec:
+      containers:
+      - name: mnist-profiler
+        image: nv-mnist:latest
+        imagePullPolicy: Never
+        command: ["python", "/app/profile.py"]
+        args: [
+          "--quick",
+          "--test-mixed-precision"
+        ]
+        env:
+        - name: KEEP_ALIVE
+          value: "1"
+        - name: KEEP_ALIVE_SECONDS
+          value: "3600"  
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+          requests:
+            nvidia.com/gpu: 1
+        volumeMounts:
+        - name: profile-script
+          mountPath: /app/profile.py
+          subPath: profile.py
+        - name: plot-volume
+          mountPath: /tmp/profile_plots
+      volumes:
+      - name: profile-script
+        hostPath:
+          path: /home/azureuser/nv-playground/profile.py
+          type: File
+      - name: plot-volume
+        emptyDir: {}
