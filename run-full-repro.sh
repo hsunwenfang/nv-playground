@@ -11,18 +11,19 @@ set -euo pipefail
 APP_IMAGE="tiny-chat:latest"; PROF_IMAGE="nv-profiler:latest"; JOB_NAME="profiler-job"
 RUN_PROFILER=0; NAMESPACE="tiny-chat"; OUT_BASE="repro_artifacts"; SKIP_BUILD=0
 BUILD_PROFILER=1; PROF_SAMPLES=2000; PROF_QUICK=1; PROF_OUTPUT_DIR="/outputs"
-DRY_RUN_BUILD=0; NO_DEPLOY=0
+DRY_RUN_BUILD=0; NO_DEPLOY=0; UNIQUE_TAG=1; REBUILD_BASE=0
 
 usage() {
   echo "Usage: $0 [--skip-build] [--no-profiler] [--run-profiler] \\
     [--app-image <tag>] [--prof-image <tag>] [--prof-samples <n>] [--prof-no-quick] \\
-    [--dry-run-build] [--no-deploy]"
+    [--dry-run-build] [--no-deploy] [--no-unique-tag]\n\nEnvironment overrides for large model path:\n  MODEL_NAME=EleutherAI/gpt-j-6B QUANTIZE=8 USE_TORCH=1 BATCH_MAX_SIZE=4 BATCH_TIMEOUT_MS=25\n  (QUANTIZE=4 for 4-bit if bitsandbytes supports it; ensure GPU memory sufficient)"
   exit 1
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --skip-build) SKIP_BUILD=1; shift ;;
+  --skip-build) SKIP_BUILD=1; shift ;;
+  --no-unique-tag) UNIQUE_TAG=0; shift ;;
   --app-image) APP_IMAGE="$2"; shift 2 ;;
   --prof-image) PROF_IMAGE="$2"; shift 2 ;;
   --no-profiler) BUILD_PROFILER=0; shift ;;
@@ -30,6 +31,7 @@ while [[ $# -gt 0 ]]; do
   --prof-samples) PROF_SAMPLES="$2"; shift 2 ;;
   --prof-no-quick) PROF_QUICK=0; shift ;;
   --dry-run-build) DRY_RUN_BUILD=1; shift ;;
+  --rebuild-base) REBUILD_BASE=1; shift ;;
   --no-deploy) NO_DEPLOY=1; shift ;;
     -h|--help) usage ;;
     *) echo "Unknown arg: $1"; usage ;;
@@ -38,6 +40,14 @@ done
 
 need() { command -v "$1" >/dev/null || { echo "Missing required command: $1"; exit 2; }; }
 for c in docker kubectl minikube; do need "$c"; done
+
+# Auto-generate unique runtime image tag if enabled and user left default (helps avoid stale cached :latest)
+if (( UNIQUE_TAG )) && [[ "$APP_IMAGE" == "tiny-chat:latest" ]]; then
+  TS=$(date +%H%M%S)
+  SHORT_SHA=$(sha1sum requirements.txt app.py 2>/dev/null | sha1sum | cut -c1-8)
+  APP_IMAGE="tiny-chat:${SHORT_SHA}-${TS}"
+  echo "[tag] Using unique image tag: $APP_IMAGE"
+fi
 
 echo "[1] Assuming existing minikube cluster is already running (use run-fresh-cluster.sh for full reset)."
 if (( ! NO_DEPLOY )); then
@@ -77,30 +87,31 @@ else
 fi
 
 NEED_BASE=1
-if [[ -f "$BASE_HASH_FILE" ]]; then
+if [[ -f "$BASE_HASH_FILE" ]] && (( ! REBUILD_BASE )); then
   PREV_BASE_HASH=$(<"$BASE_HASH_FILE")
   if [[ "$PREV_BASE_HASH" == "$REQ_SHA" ]] && { (( DRY_RUN_BUILD )) || docker image inspect tiny-chat:base >/dev/null 2>&1; }; then
     NEED_BASE=0
     echo "[base] Reusing tiny-chat:base (no requirements change)"
   fi
 fi
+if (( REBUILD_BASE )); then
+  echo "[base] Forced rebuild requested (--rebuild-base)"
+  NEED_BASE=1
+fi
 if (( NEED_BASE )); then
   if (( DRY_RUN_BUILD )); then
     echo "[base] (dry-run) Would build tiny-chat:base"
   elif (( ! SKIP_BUILD )); then
     echo "[base] Building tiny-chat:base"
-    DOCKER_BUILDKIT=1 docker build --build-arg REQ_SHA="$REQ_SHA" -t tiny-chat:base -f Dockerfile.base .
+    DOCKER_BUILDKIT=1 docker build -t tiny-chat:base -f Dockerfile.base .
+    echo "$REQ_SHA" > "$BASE_HASH_FILE"
   fi
-  echo "$REQ_SHA" > "$BASE_HASH_FILE"
 fi
 
-echo "[runtime] Building $APP_IMAGE (always)"
-if (( DRY_RUN_BUILD )); then
-  echo "[runtime] (dry-run) Would build runtime image"
-else
-  if (( ! SKIP_BUILD )); then
-    DOCKER_BUILDKIT=1 docker build -t "$APP_IMAGE" -f Dockerfile.runtime .
-  fi
+# Always (re)build runtime image when not skipping build (ensures unique tag image exists)
+if (( ! DRY_RUN_BUILD )) && (( ! SKIP_BUILD )); then
+  echo "[runtime] Building runtime image $APP_IMAGE"
+  DOCKER_BUILDKIT=1 docker build -t "$APP_IMAGE" -f Dockerfile.runtime .
 fi
 
 if [[ -n "${FORCE_NEW_RUNTIME_ID:-}" ]]; then
@@ -167,13 +178,19 @@ if (( NO_DEPLOY )); then
 else
   echo "[7] Deploy tiny chat service"
   kubectl get ns "$NAMESPACE" >/dev/null 2>&1 || kubectl create ns "$NAMESPACE"
-  kubectl apply -f k8s-deployment.yaml
-  if [[ "$RUNTIME_CHANGED" == "1" ]]; then
-    echo "[rollout] Runtime image changed -> rollout restart"
-    kubectl -n "$NAMESPACE" rollout restart deploy/tiny-chat || true
-  else
-    echo "[rollout] No runtime image change -> no restart"
+  TMP_DEPLOY=$(mktemp)
+  cp k8s-deployment.yaml "$TMP_DEPLOY"
+  # Inject unique tag (replace only default image occurrence)
+  if grep -q 'image: tiny-chat:latest' "$TMP_DEPLOY" && [[ "$APP_IMAGE" != "tiny-chat:latest" ]]; then
+    sed -i "s#image: tiny-chat:latest#image: ${APP_IMAGE}#" "$TMP_DEPLOY"
   fi
+  # Inject forced torch env vars if missing
+  if ! grep -q 'FORCE_TORCH' "$TMP_DEPLOY"; then
+    awk '/env:/ && !f {print;print "        - name: FORCE_TORCH\n          value: \"1\"\n        - name: USE_TORCH\n          value: \"1\"\n        - name: ENABLE_BATCHING\n          value: \"1\"\n        - name: QUANTIZE\n          value: \"8\"\n        - name: BATCH_MAX_SIZE\n          value: \"4\"";f=1;next}1' "$TMP_DEPLOY" > "$TMP_DEPLOY.tmp" && mv "$TMP_DEPLOY.tmp" "$TMP_DEPLOY"
+  fi
+  echo "[deploy] Applying unified manifest (single RS expected)"
+  kubectl apply -f "$TMP_DEPLOY"
+  rm -f "$TMP_DEPLOY"
   echo "[8] Wait for deployment ready"
   kubectl -n "$NAMESPACE" rollout status deploy/tiny-chat --timeout=180s
   echo "[9] Service endpoints"
@@ -190,51 +207,21 @@ fi
 if (( RUN_PROFILER )) && (( ! NO_DEPLOY )); then
   echo "[12] Running profiler Job ($JOB_NAME)"
   kubectl get ns "$NAMESPACE" >/dev/null 2>&1 || kubectl create ns "$NAMESPACE"
-
-  # Prefer dynamic generation (ensures namespace + customizable args); fallback to existing manifest if requested file present and env overrides disabled.
   TMP_MANIFEST=$(mktemp)
   echo "Generating profiler Job manifest (samples=$PROF_SAMPLES quick=$PROF_QUICK image=$PROF_IMAGE)"
-  cat > "$TMP_MANIFEST" <<EOF
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: $JOB_NAME
-  namespace: $NAMESPACE
-spec:
-  backoffLimit: 0
-  template:
-    metadata:
-      labels:
-        job-name: $JOB_NAME
-    spec:
-      restartPolicy: Never
-      containers:
-      - name: profiler
-        image: $PROF_IMAGE
-        imagePullPolicy: IfNotPresent
-        command: ["python","/app/profile.py"]
-        args:
-$( (( PROF_QUICK )) && echo '          - "--quick"' )
-          - "--samples"
-          - "$PROF_SAMPLES"
-          - "--output-dir"
-          - "$PROF_OUTPUT_DIR"
-        resources:
-          limits:
-            nvidia.com/gpu: 1
-          requests:
-            nvidia.com/gpu: 1
-        volumeMounts:
-        - name: outputs
-          mountPath: $PROF_OUTPUT_DIR
-      volumes:
-      - name: outputs
-        emptyDir: {}
-EOF
-
+  {
+    echo "apiVersion: batch/v1"
+    echo "kind: Job"
+    echo "metadata:"; echo "  name: $JOB_NAME"; echo "  namespace: $NAMESPACE"
+    echo "spec:"; echo "  backoffLimit: 0"; echo "  template:"; echo "    metadata:"; echo "      labels:"; echo "        job-name: $JOB_NAME"; echo "    spec:"; echo "      restartPolicy: Never"; echo "      containers:"; echo "      - name: profiler"; echo "        image: $PROF_IMAGE"; echo "        imagePullPolicy: IfNotPresent"; echo "        command: [\"python\",\"/app/profile.py\"]"; echo "        args:";
+    if (( PROF_QUICK )); then echo "          - --quick"; fi
+    echo "          - --samples"; echo "          - $PROF_SAMPLES"; echo "          - --output-dir"; echo "          - $PROF_OUTPUT_DIR";
+    echo "        resources:"; echo "          limits:"; echo "            nvidia.com/gpu: 1"; echo "          requests:"; echo "            nvidia.com/gpu: 1";
+    echo "        volumeMounts:"; echo "        - name: outputs"; echo "          mountPath: $PROF_OUTPUT_DIR";
+    echo "      volumes:"; echo "      - name: outputs"; echo "        emptyDir: {}";
+  } > "$TMP_MANIFEST"
   kubectl apply -f "$TMP_MANIFEST"
   rm -f "$TMP_MANIFEST"
-
   echo "Waiting for profiler Job completion (10m timeout)"
   if ! kubectl -n "$NAMESPACE" wait --for=condition=complete job/$JOB_NAME --timeout=10m; then
     echo "Profiler job failed or timed out" >&2
@@ -249,7 +236,6 @@ EOF
       if kubectl -n "$NAMESPACE" exec "$PODP" -- test -d "$PROF_OUTPUT_DIR" 2>/dev/null; then
         kubectl -n "$NAMESPACE" cp "$PODP:$PROF_OUTPUT_DIR" "$OUT_DIR/outputs" || true
       fi
-      # Tar outputs for easier sharing
       if [[ -d "$OUT_DIR/outputs" ]]; then
         ( cd "$OUT_DIR" && tar -czf outputs.tar.gz outputs ) || true
       fi

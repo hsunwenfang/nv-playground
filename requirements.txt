@@ -1,6 +1,9 @@
-tensorflow>=2.11.0
 numpy
 prometheus_client
 fastapi
 uvicorn[standard]
 transformers
+plotly==5.22.0
+torch
+accelerate
+bitsandbytes

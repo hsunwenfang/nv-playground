@@ -9,6 +9,8 @@ metadata:
   name: tiny-chat
   namespace: tiny-chat
 spec:
+  strategy:
+    type: Recreate
   revisionHistoryLimit: 0
   replicas: 1
   selector:
@@ -35,6 +37,21 @@ spec:
           value: "1"
         - name: ALLOW_CPU_FALLBACK
           value: "0"
+        - name: MAX_CONTEXT_TOKENS
+          value: "1024"
+        - name: BATCH_MAX_SIZE
+          value: "4"
+        - name: BATCH_TIMEOUT_MS
+          value: "25"
+        - name: QUANTIZE
+          value: "8"
+        - name: USE_TORCH
+          value: "1"
+        - name: ENABLE_BATCHING
+          value: "1"
+        # Example large model override (commented by default to keep small image runtime)
+        # - name: MODEL_NAME
+        #   value: "EleutherAI/gpt-j-6B"
         resources:
           requests:
             cpu: 200m

@@ -1,7 +1,10 @@
-FROM tensorflow/tensorflow:2.12.0-gpu AS deps
+FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04 AS deps
 ARG REQ_SHA="dev"
 LABEL org.tinychat.reqsha=${REQ_SHA}
 WORKDIR /app
 COPY requirements.txt .
-RUN python -m pip install --upgrade pip && \
-    pip install --no-cache-dir --prefer-binary -r requirements.txt
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip python3-dev git ca-certificates && \
+    ln -sf /usr/bin/python3 /usr/bin/python && \
+    python -m pip install --upgrade pip && \
+    pip install --no-cache-dir --prefer-binary -r requirements.txt && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*

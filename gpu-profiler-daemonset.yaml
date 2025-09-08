@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gpu-profiler-monitor
+  namespace: tiny-chat
+  labels:
+    app: gpu-profiler-monitor
+spec:
+  selector:
+    matchLabels:
+      app: gpu-profiler-monitor
+  template:
+    metadata:
+      labels:
+        app: gpu-profiler-monitor
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9400"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: default
+      containers:
+      - name: profiler-monitor
+        image: nv-profiler:latest
+        imagePullPolicy: IfNotPresent
+        command: ["python","/app/profile.py"]
+        args:
+          - "--metrics-only"
+          - "--prometheus"
+          - "--prometheus-port"
+          - "9400"
+          - "--sample-interval"
+          - "5"
+          - "--duration"
+          - "0"
+          - "--enable-dmon"
+          - "--dmon-select"
+          - "pucvmet"
+        ports:
+        - name: metrics
+          containerPort: 9400
+        resources: {}
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}

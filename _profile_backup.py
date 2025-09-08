@@ -700,131 +700,6 @@ def generate_profile_plots(metrics, model_name="model", output_dir="/tmp"):
     log("plots_generated", plot_dir=plot_dir, paths=plot_paths)
     return plot_paths
 
-########################### METRICS-ONLY MODE (Prometheus / dmon / DCGM) ###########################
-def run_metrics_only(args):
-    """Continuous GPU metrics sampler (no training). Supports optional Prometheus export, nvidia-smi dmon, DCGM.
-    Runs until duration elapses (>0) or indefinitely (duration <= 0)."""
-    interval = max(0.25, getattr(args, 'sample_interval', 2.0))
-    duration = getattr(args, 'duration', 60.0)
-    target_substr = getattr(args, 'target_process_name', '').strip().lower()
-    enable_dmon = getattr(args, 'enable_dmon', False)
-    dmon_select = getattr(args, 'dmon_select', 'pucvmet')
-    enable_dcgm = getattr(args, 'enable_dcgm', False)
-    dcgm_fields = getattr(args, 'dcgm_fields', '')
-    prom_enabled = getattr(args, 'prometheus', False)
-    prom_port = int(getattr(args, 'prometheus_port', 9400))
-    start_time = time.time()
-    gpu_samples = []
-    proc_samples = []
-    prom_started = False
-    if prom_enabled:
-        try:
-            from prometheus_client import start_http_server, Gauge
-            start_http_server(prom_port)
-            run_metrics_only.g_gpu_util = Gauge('gpu_utilization_percent', 'GPU utilization percent', ['gpu_index'])
-            run_metrics_only.g_gpu_mem_used_bytes = Gauge('gpu_memory_used_bytes', 'GPU memory used (bytes)', ['gpu_index'])
-            run_metrics_only.g_gpu_mem_total_bytes = Gauge('gpu_memory_total_bytes', 'GPU memory total (bytes)', ['gpu_index'])
-            run_metrics_only.g_gpu_power_watts = Gauge('gpu_power_watts', 'GPU power draw (Watts)', ['gpu_index'])
-            run_metrics_only.g_gpu_temp_celsius = Gauge('gpu_temperature_celsius', 'GPU temperature (C)', ['gpu_index'])
-            run_metrics_only.g_gpu_sm_clock_mhz = Gauge('gpu_sm_clock_mhz', 'GPU SM clock (MHz)', ['gpu_index'])
-            run_metrics_only.g_last_sample_ts = Gauge('gpu_monitor_last_sample_timestamp_seconds', 'Last sample timestamp (epoch seconds)')
-            run_metrics_only.g_gpu_util_mean = Gauge('gpu_utilization_mean_percent', 'Mean GPU utilization across all GPUs')
-            prom_started = True
-            log('prometheus_exporter_started', port=prom_port)
-        except Exception as e:
-            log('prometheus_exporter_error', error=str(e))
-            prom_enabled = False
-    log('metrics_only_start', interval=interval, duration=duration, enable_dmon=enable_dmon, enable_dcgm=enable_dcgm,
-        dmon_select=dmon_select, dcgm_fields=dcgm_fields, prometheus=prom_enabled)
-    dcgm_fields_list = None
-    if enable_dcgm and dcgm_fields:
-        try:
-            dcgm_fields_list = [f.strip() for f in dcgm_fields.split(',') if f.strip()]
-        except Exception:
-            dcgm_fields_list = None
-    while True:
-        now = time.time()
-        g_list = capture_nvidia_smi()
-        if g_list:
-            # append per-GPU snapshot
-            for g in g_list:
-                gpu_samples.append({"ts": now, **g})
-            if prom_enabled and prom_started:
-                util_vals = []
-                for g in g_list:
-                    idx = str(g.get('index', '0'))
-                    util = float(g.get('utilization.gpu', 0))
-                    mem_used_mib = float(g.get('memory.used', 0))
-                    mem_total_mib = float(g.get('memory.total', 0))
-                    power = float(g.get('power.draw', 0))
-                    temp = float(g.get('temperature.gpu', 0))
-                    sm_clock = float(g.get('clocks.current.sm', 0))
-                    run_metrics_only.g_gpu_util.labels(gpu_index=idx).set(util)
-                    run_metrics_only.g_gpu_mem_used_bytes.labels(gpu_index=idx).set(mem_used_mib * 1024 * 1024)
-                    run_metrics_only.g_gpu_mem_total_bytes.labels(gpu_index=idx).set(mem_total_mib * 1024 * 1024)
-                    run_metrics_only.g_gpu_power_watts.labels(gpu_index=idx).set(power)
-                    run_metrics_only.g_gpu_temp_celsius.labels(gpu_index=idx).set(temp)
-                    run_metrics_only.g_gpu_sm_clock_mhz.labels(gpu_index=idx).set(sm_clock)
-                    util_vals.append(util)
-                if util_vals:
-                    run_metrics_only.g_gpu_util_mean.set(float(np.mean(util_vals)))
-                run_metrics_only.g_last_sample_ts.set(now)
-        else:
-            log('metrics_only_no_gpu_visible')
-        # dmon
-        if enable_dmon:
-            dmon_data = sample_nvidia_dmon(dmon_select)
-            if dmon_data:
-                for d in dmon_data:
-                    d['ts'] = now
-                    gpu_samples.append({"ts": now, "dmon": d})
-        # dcgm
-        if enable_dcgm:
-            dcgm_data = sample_dcgm(dcgm_fields_list)
-            if dcgm_data:
-                for d in dcgm_data:
-                    d['ts'] = now
-                    gpu_samples.append({"ts": now, "dcgm": d})
-        # per-process memory
-        if g_list:
-            try:
-                proc_res = subprocess.run([
-                    'nvidia-smi', '--query-compute-apps=pid,process_name,used_memory', '--format=csv,noheader,nounits'
-                ], capture_output=True, text=True, check=True)
-                lines = [l.strip() for l in proc_res.stdout.splitlines() if l.strip()]
-                for line in lines:
-                    parts = [p.strip() for p in line.split(',')]
-                    if len(parts) >= 3 and parts[0].isdigit():
-                        pid_s, pname, mem_s = parts[:3]
-                        if (not target_substr) or (target_substr in pname.lower()):
-                            proc_samples.append({"ts": now, "pid": int(pid_s), "process_name": pname, "used_memory_mib": int(mem_s)})
-            except Exception:
-                pass
-        if duration > 0 and (now - start_time) >= duration:
-            break
-        time.sleep(interval)
-    # Summaries
-    summary = {}
-    if gpu_samples:
-        util_vals = [s.get('utilization.gpu', 0) for s in gpu_samples if 'utilization.gpu' in s]
-        mem_used_vals = [s.get('memory.used', 0) for s in gpu_samples if 'memory.used' in s]
-        summary = {
-            'gpu_count': len({s.get('index') for s in gpu_samples if s.get('index') is not None}),
-            'mean_gpu_util': float(np.mean(util_vals)) if util_vals else 0.0,
-            'max_gpu_util': float(np.max(util_vals)) if util_vals else 0.0,
-            'mean_mem_used_mib': float(np.mean(mem_used_vals)) if mem_used_vals else 0.0,
-            'max_mem_used_mib': float(np.max(mem_used_vals)) if mem_used_vals else 0.0,
-            'sample_count': len(gpu_samples),
-            'process_sample_count': len(proc_samples)
-        }
-    out_dir = getattr(args, 'output_dir', '/tmp')
-    os.makedirs(out_dir, exist_ok=True)
-    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-    out_path = os.path.join(out_dir, f'gpu_metrics_only_{ts}.json')
-    with open(out_path, 'w') as f:
-        json.dump({'summary': summary, 'gpu_samples': gpu_samples, 'process_samples': proc_samples}, f)
-    log('metrics_only_complete', path=out_path, **summary)
-
 
 # -------------------- Metrics-only functionality (app sidecar use-case) --------------------
 def run_metrics_only(args):
@@ -970,7 +845,7 @@ def run_metrics_only(args):
 
 def main():
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Enhanced GPU Profiling for TensorFlow MNIST / Metrics Monitor')
+    parser = argparse.ArgumentParser(description='Enhanced GPU Profiling for TensorFlow MNIST')
     parser.add_argument('--batch-sizes', type=str, default='32,64,128,256',
                       help='Comma-separated list of batch sizes to test')
     parser.add_argument('--model-sizes', type=str, default='small',
@@ -995,23 +870,34 @@ def main():
                       help='Interval (seconds) for high-frequency GPU sampler thread')
     parser.add_argument('--disable-gpu-sampler', action='store_true',
                       help='Disable high-frequency GPU sampler thread')
-    # Metrics-only & monitoring flags
-    parser.add_argument('--metrics-only', action='store_true', help='Run in metrics-only monitoring mode (no training)')
-    parser.add_argument('--sample-interval', type=float, default=2.0, help='Sample interval seconds for metrics-only mode')
-    parser.add_argument('--duration', type=float, default=60.0, help='Total duration (seconds); <=0 means run indefinitely')
-    parser.add_argument('--target-process-name', type=str, default='', help='Substring filter for process names (metrics-only)')
-    parser.add_argument('--enable-dmon', action='store_true', help='Enable nvidia-smi dmon one-shot sampling')
-    parser.add_argument('--dmon-select', type=str, default='pucvmet', help='nvidia-smi dmon -s flags (default pucvmet)')
-    parser.add_argument('--enable-dcgm', action='store_true', help='Enable DCGM dmon sampling if dcgmi is present')
-    parser.add_argument('--dcgm-fields', type=str, default='', help='Comma-separated DCGM field IDs to query')
-    parser.add_argument('--prometheus', action='store_true', help='Enable Prometheus exporter (metrics-only mode)')
-    parser.add_argument('--prometheus-port', type=int, default=9400, help='Prometheus exporter port')
-    parser.add_argument('--prometheus-addr', type=str, default='0.0.0.0', help='Prometheus exporter bind address (best effort)')
+    parser.add_argument('--metrics-only', action='store_true',
+                      help='Only sample GPU metrics (no model training)')
+    parser.add_argument('--sample-interval', type=float, default=2.0,
+                      help='Sampling interval seconds for --metrics-only mode')
+    parser.add_argument('--duration', type=float, default=60.0,
+                      help='Total duration seconds for --metrics-only mode (<=0 means infinite)')
+    parser.add_argument('--target-process-name', type=str, default='',
+                      help='Substring to filter compute process names in metrics-only mode')
+    parser.add_argument('--enable-dmon', action='store_true',
+                      help='Enable nvidia-smi dmon one-shot sampling each interval')
+    parser.add_argument('--dmon-select', type=str, default='pucvmet',
+                      help='nvidia-smi dmon -s selection flags (default pucvmet)')
+    parser.add_argument('--enable-dcgm', action='store_true',
+                      help='Enable dcgmi dmon sampling if dcgmi present')
+    parser.add_argument('--dcgm-fields', type=str, default='',
+                      help='Comma-separated DCGM field IDs to query (optional)')
+    parser.add_argument('--prometheus', action='store_true',
+                      help='Enable Prometheus metrics exporter for metrics-only mode')
+    parser.add_argument('--prometheus-port', type=int, default=9400,
+                      help='Prometheus exporter port')
+    parser.add_argument('--prometheus-addr', type=str, default='0.0.0.0',
+                      help='Prometheus exporter bind address (best-effort)')
     args = parser.parse_args()
     
     # Initial GPU check
     see_gpus()
 
+    # Metrics-only fast path (avoid running training & keep-alive loop)
     if args.metrics_only:
         run_metrics_only(args)
         return
@@ -1314,3 +1200,68 @@ def generate_comparison_report(results):
 
 if __name__ == "__main__":
     main()
+
+# -------------------- Metrics-only functionality (app sidecar use-case) --------------------
+def run_metrics_only(args):
+    """Sample GPU metrics without reserving a GPU resource.
+    Intended for sidecar container that does NOT request nvidia.com/gpu.
+    Relies on /dev/nvidia* device access via hostPath or utility capability.
+    """
+    interval = max(0.5, args.sample_interval)
+    duration = args.duration
+    target_substr = args.target_process_name.strip().lower()
+    start = time.time()
+    samples = []
+    proc_samples = []
+    log("metrics_only_start", interval=interval, duration=duration, target_process_name=target_substr)
+    while True:
+        now = time.time()
+        g = capture_nvidia_smi()
+        if g:
+            # Basic per-GPU stats
+            for gpu in g:
+                entry = {"ts": now, **gpu}
+                samples.append(entry)
+            # Per-process utilization (memory) if possible
+            try:
+                proc_res = subprocess.run([
+                    "nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader,nounits"
+                ], capture_output=True, text=True, check=True)
+                lines = [l.strip() for l in proc_res.stdout.strip().split('\n') if l.strip()]
+                for line in lines:
+                    parts = [p.strip() for p in line.split(',')]
+                    if len(parts) >= 3:
+                        pid_s, pname, mem_s = parts[:3]
+                        if pid_s.isdigit():
+                            rec = {"ts": now, "pid": int(pid_s), "process_name": pname, "used_memory_mib": int(mem_s)}
+                            if (not target_substr) or (target_substr in pname.lower()):
+                                proc_samples.append(rec)
+            except Exception:
+                pass
+        else:
+            log("metrics_only_no_gpu_visible")
+        if duration > 0 and (now - start) >= duration:
+            break
+        time.sleep(interval)
+
+    # Aggregate simple stats
+    summary = {}
+    if samples:
+        util_key = 'utilization.gpu'
+        mem_used_key = 'memory.used'
+        summary = {
+            'gpu_count': len({s.get('index') for s in samples}),
+            'mean_gpu_util': float(np.mean([s.get(util_key, 0) for s in samples])),
+            'max_gpu_util': float(np.max([s.get(util_key, 0) for s in samples])),
+            'mean_mem_used_mib': float(np.mean([s.get(mem_used_key, 0) for s in samples])),
+            'max_mem_used_mib': float(np.max([s.get(mem_used_key, 0) for s in samples])),
+            'sample_count': len(samples),
+            'process_sample_count': len(proc_samples)
+        }
+    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    out_dir = getattr(args, 'output_dir', '/tmp')
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f'gpu_metrics_only_{timestamp}.json')
+    with open(out_path, 'w') as f:
+        json.dump({'summary': summary, 'gpu_samples': samples, 'process_samples': proc_samples}, f)
+    log("metrics_only_complete", path=out_path, **summary)
